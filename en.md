@@ -1,0 +1,815 @@
+说明：
+我计划用fastapi+angular，实现一个在线聊天室的功能，
+1.必须有一个服务端和多个客户端
+2.用一个列表，显示当前所有在线的用户
+3.所有在线的用户，必须实现群聊和单独聊天
+效果图：
+![在这里插入图片描述](https://i-blog.csdnimg.cn/direct/a6cbd2bfb00a43408fd94726827f5a26.png#pic_center)
+新增安卓测试程序 C:\Users\wangrusheng\AndroidStudioProjects\MyApplication9\app\src\test\java\com\example\myapplication\MyFirstTest.kt
+
+```java
+package com.example.myapplication
+
+import kotlinx.coroutines.*
+import okhttp3.*
+import java.util.*
+import java.util.concurrent.TimeUnit
+import com.google.gson.Gson
+
+fun main() = runBlocking {
+    val client = ChatTester("UserA", "ws://127.0.0.1:8000/ws") // Android emulator local address
+    launch { client.start() }
+
+    // Test operation sequence
+    delay(1500) // Wait for connection establishment
+    client.sendPublicMessage("Hello everyone, this is UserA")
+    delay(1000)
+    client.sendPrivateMessage("UserB", "Hi B, this is a private message")
+    delay(3000)
+
+    client.close()
+}
+
+class ChatTester(private val username: String, private val wsUrl: String) {
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(10, TimeUnit.SECONDS) // Connection timeout[6](@ref)
+        .build()
+
+    private var webSocket: WebSocket? = null
+    private val gson = Gson()
+    private val scope = CoroutineScope(Dispatchers.Default)
+
+    fun start() {
+        val request = Request.Builder().url(wsUrl).build()
+        webSocket = client.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                println("[$username] Connection established")
+                sendInitMessage()
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                handleMessage(text)
+            }
+
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                println("[$username] Connection closed")
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                println("[$username] Connection error: ${t.message}")
+            }
+        })
+    }
+
+    private fun sendInitMessage() {
+        val initMsg = mapOf("username" to username)
+        webSocket?.send(gson.toJson(initMsg))
+    }
+
+    fun sendPublicMessage(content: String) {
+        val message = mapOf(
+            "type" to "public",
+            "content" to content
+        )
+        webSocket?.send(gson.toJson(message))
+        println("[$username] Sent public message: $content")
+    }
+
+    fun sendPrivateMessage(targetUser: String, content: String) {
+        val message = mapOf(
+            "type" to "private",
+            "to" to targetUser,
+            "content" to content
+        )
+        webSocket?.send(gson.toJson(message))
+        println("[$username] Sent private to $targetUser: $content")
+    }
+
+    private fun handleMessage(json: String) {
+        val data = gson.fromJson(json, Map::class.java)
+        when (data["type"]) {
+            "user_list" -> {
+                val users = data["users"] as List<Map<String, String>>
+                println("\n[$username] Online users updated:")
+                users.forEach { println("  ${it["client_id"]} - ${it["username"]}") }
+            }
+            "private" -> {
+                println("\n[$username] Received private from ${data["sender_name"]}: ${data["content"]}")
+            }
+            "public" -> {
+                println("\n[$username] Received public message from ${data["sender_name"]}: ${data["content"]}")
+            }
+            "system" -> {
+                println("\n[$username] System notification: ${data["content"]}")
+            }
+        }
+    }
+
+    fun close() {
+        webSocket?.close(1000, "Normal closure")
+        client.dispatcher.executorService.shutdown()
+    }
+}
+```
+
+step1:C:\Users\wag\PycharmProjects\FastAPIProject\main.py
+
+```python
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Dict
+import uuid
+import json
+import datetime
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ChatServer")
+
+app = FastAPI()
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, dict] = {}
+
+    async def connect(self, websocket: WebSocket, client_id: str, username: str):
+        self.active_connections[client_id] = {
+            "websocket": websocket,
+            "username": username
+        }
+        logger.info(f"用户 {username}({client_id}) 已连接")
+        await self._broadcast_user_list()
+        await self._send_system_message(f"{username} 进入聊天室")
+
+    async def disconnect(self, client_id: str):
+        if client_id in self.active_connections:
+            user = self.active_connections[client_id]
+            del self.active_connections[client_id]
+            logger.info(f"用户 {user['username']}({client_id}) 已断开")
+            await self._broadcast_user_list()
+            await self._send_system_message(f"{user['username']} 已离开")
+
+    async def handle_message(self, sender_id: str, data: dict):
+        if data["type"] == "private":
+            await self._send_private_message(
+                sender_id=sender_id,
+                recipient_id=data["to"],
+                content=data["content"]
+            )
+        else:
+            await self._broadcast_message(sender_id, data["content"])
+
+    async def _send_private_message(self, sender_id: str, recipient_id: str, content: str):
+        sender = self.active_connections.get(sender_id)
+        recipient = self.active_connections.get(recipient_id)
+
+        if sender and recipient:
+            message = {
+                "type": "private",
+                "from": sender_id,
+                "to": recipient_id,
+                "sender_name": sender["username"],
+                "content": content,
+                "timestamp": self._current_time()
+            }
+            await recipient["websocket"].send_text(json.dumps(message))
+            await sender["websocket"].send_text(json.dumps(message))  # 回显
+
+    async def _broadcast_message(self, sender_id: str, content: str):
+        sender = self.active_connections.get(sender_id)
+        if sender:
+            message = {
+                "type": "public",
+                "from": sender_id,
+                "sender_name": sender["username"],
+                "content": content,
+                "timestamp": self._current_time()
+            }
+            for conn in self.active_connections.values():
+                await conn["websocket"].send_text(json.dumps(message))
+
+    async def _send_system_message(self, content: str):
+        message = {
+            "type": "system",
+            "content": content,
+            "timestamp": self._current_time()
+        }
+        for conn in self.active_connections.values():
+            await conn["websocket"].send_text(json.dumps(message))
+
+    async def _broadcast_user_list(self):
+        users = [{
+            "client_id": cid,
+            "username": info["username"]
+        } for cid, info in self.active_connections.items()]
+
+        message = {
+            "type": "user_list",
+            "users": users
+        }
+        for conn in self.active_connections.values():
+            await conn["websocket"].send_text(json.dumps(message))
+
+    def _current_time(self):
+        return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    client_id = str(uuid.uuid4())[:8]  # 生成8位短ID
+
+    try:
+        # 接收初始化信息
+        init_data = await websocket.receive_json()
+        username = init_data.get("username", f"用户{client_id}")
+
+        await manager.connect(websocket, client_id, username)
+
+        while True:
+            data = await websocket.receive_json()
+            await manager.handle_message(client_id, data)
+
+    except json.JSONDecodeError:
+        logger.error("收到无效的JSON数据")
+    except WebSocketDisconnect:
+        await manager.disconnect(client_id)
+    except Exception as e:
+        logger.error(f"连接异常: {str(e)}")
+        await manager.disconnect(client_id)
+    finally:
+        await websocket.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
+
+step2:C:\Users\wg\PycharmProjects\FastAPIProject\client.py
+
+```python
+import websockets
+import asyncio
+import json
+import time
+
+
+class ChatClient:
+    def __init__(self):
+        self.username = ""
+        self.client_id = ""
+
+    async def run(self):
+        self.username = input("请输入用户名: ")
+        async with websockets.connect("ws://localhost:8000/ws") as websocket:
+            # 发送初始化信息
+            await websocket.send(json.dumps({"username": self.username}))
+
+            # 消息接收任务
+            receive_task = asyncio.create_task(self.receive_handler(websocket))
+
+            try:
+                while True:
+                    await self.input_handler(websocket)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                pass
+            finally:
+                receive_task.cancel()
+                await receive_task
+
+    async def receive_handler(self, websocket):
+        try:
+            async for message in websocket:
+                data = json.loads(message)
+                self.handle_message(data)
+        except websockets.ConnectionClosed:
+            print("\n连接已断开")
+
+    def handle_message(self, data):
+        msg_type = data["type"]
+        timestamp = data.get("timestamp", "")
+
+        if msg_type == "user_list":
+            print("\n" + "=" * 50)
+            print("📋 在线用户列表（ID | 用户名）")
+            print("-" * 50)
+            for user in data["users"]:
+                print(f"  {user['client_id']} | {user['username']}")
+            print("=" * 50 + "\n")
+
+        elif msg_type == "private":
+            sender = data["sender_name"]
+            content = data["content"]
+            print(f"\n🔒 [{timestamp}] 来自 {sender} 的私聊消息:")
+            print(f"   {content}")
+
+        elif msg_type == "public":
+            sender = data["sender_name"]
+            content = data["content"]
+            print(f"\n📢 [{timestamp}] 公共消息 {sender}:")
+            print(f"   {content}")
+
+        elif msg_type == "system":
+            print(f"\n⚠️ [{timestamp}] 系统通知:")
+            print(f"   {data['content']}")
+
+    async def input_handler(self, websocket):
+        prompt = "\n输入消息（格式说明）:\n" \
+                 "1. 群发消息 → 直接输入内容\n" \
+                 "2. 私聊消息 → @用户ID 消息内容\n" \
+                 "3. 退出 → 输入 exit\n" \
+                 "请输入: "
+
+        cmd = await asyncio.get_event_loop().run_in_executor(None, input, prompt)
+
+        if cmd.lower() == 'exit':
+            await websocket.close()
+            raise asyncio.CancelledError
+
+        if cmd.startswith("@"):
+            parts = cmd.split(" ", 1)
+            if len(parts) == 2:
+                user_id, content = parts[0][1:], parts[1]
+                message = {
+                    "type": "private",
+                    "to": user_id,
+                    "content": content
+                }
+                await websocket.send(json.dumps(message))
+                return
+            else:
+                print("! 私聊格式错误，正确格式：@用户ID 消息内容")
+                return
+
+        # 发送公共消息
+        await websocket.send(json.dumps({
+            "type": "public",
+            "content": cmd
+        }))
+
+
+if __name__ == "__main__":
+    client = ChatClient()
+    try:
+        asyncio.run(client.run())
+    except KeyboardInterrupt:
+        print("\n客户端已退出")
+```
+
+step3:好了，后端代码写完了，接下来是验证，首先运行服务端
+
+```bash
+(.venv) PS C:\Users\wangrusheng\PycharmProjects\FastAPIProject> python main.py
+INFO:     Started server process [9720]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+INFO:     ('127.0.0.1', 51061) - "WebSocket /ws" [accepted]
+INFO:     connection open
+INFO:ChatServer:用户 张飞(bf0c711b) 已连接
+INFO:     ('127.0.0.1', 51071) - "WebSocket /ws" [accepted]
+INFO:     connection open
+INFO:ChatServer:用户 刘备(4be9b4df) 已连接
+
+
+```
+
+step4:然后开启两个控制台窗口，分别运行客户端程序 比如，客户端1
+
+```bash
+(.venv) PS C:\Users\wangrusheng\PycharmProjects\FastAPIProject> python client.py
+请输入用户名: 张飞 
+
+输入消息（格式说明）:
+1. 群发消息 → 直接输入内容
+2. 私聊消息 → @用户ID 消息内容
+3. 退出 → 输入 exit
+请输入: 
+==================================================
+📋 在线用户列表（ID | 用户名）
+--------------------------------------------------
+  bf0c711b | 张飞
+==================================================
+
+
+⚠️ [2025-03-14 05:05:40] 系统通知:
+   张飞 进入聊天室
+
+==================================================
+📋 在线用户列表（ID | 用户名）
+--------------------------------------------------
+  bf0c711b | 张飞
+  4be9b4df | 刘备
+==================================================
+
+
+⚠️ [2025-03-14 05:05:47] 系统通知:
+   刘备 进入聊天室
+
+📢 [2025-03-14 05:05:57] 公共消息 刘备:
+   hello
+今天天气不错
+
+输入消息（格式说明）:
+1. 群发消息 → 直接输入内容
+2. 私聊消息 → @用户ID 消息内容
+3. 退出 → 输入 exit
+请输入:
+📢 [2025-03-14 05:06:12] 公共消息 张飞:
+   今天天气不错
+
+📢 [2025-03-14 05:06:20] 公共消息 刘备:
+   是的，适合郊游
+@4be9b4df 大哥，要不，今天去聚餐吧
+
+输入消息（格式说明）:
+1. 群发消息 → 直接输入内容
+2. 私聊消息 → @用户ID 消息内容
+3. 退出 → 输入 exit
+请输入:
+🔒 [2025-03-14 05:06:48] 来自 张飞 的私聊消息:
+   大哥，要不，今天去聚餐吧
+
+🔒 [2025-03-14 05:07:09] 来自 刘备 的私聊消息:
+   可以的，三弟，叫上关羽
+
+```
+
+step5:客户端2
+
+```bash
+(.venv) PS C:\Users\wangrusheng\PycharmProjects\FastAPIProject> python client.py
+请输入用户名: 刘备
+
+输入消息（格式说明）:
+1. 群发消息 → 直接输入内容
+2. 私聊消息 → @用户ID 消息内容
+3. 退出 → 输入 exit
+请输入: 
+==================================================
+📋 在线用户列表（ID | 用户名）
+--------------------------------------------------
+  bf0c711b | 张飞
+  4be9b4df | 刘备
+==================================================
+
+
+⚠️ [2025-03-14 05:05:47] 系统通知:
+   刘备 进入聊天室
+hello
+
+输入消息（格式说明）:
+1. 群发消息 → 直接输入内容
+2. 私聊消息 → @用户ID 消息内容
+3. 退出 → 输入 exit
+请输入:
+📢 [2025-03-14 05:05:57] 公共消息 刘备:
+   hello
+
+📢 [2025-03-14 05:06:12] 公共消息 张飞:
+   今天天气不错
+是的，适合郊游
+
+输入消息（格式说明）:
+1. 群发消息 → 直接输入内容
+2. 私聊消息 → @用户ID 消息内容
+3. 退出 → 输入 exit
+请输入:
+📢 [2025-03-14 05:06:20] 公共消息 刘备:
+   是的，适合郊游
+
+🔒 [2025-03-14 05:06:48] 来自 张飞 的私聊消息:
+   大哥，要不，今天去聚餐吧
+@bf0c711b 可以的，三弟，叫上关羽
+
+输入消息（格式说明）:
+1. 群发消息 → 直接输入内容
+2. 私聊消息 → @用户ID 消息内容
+3. 退出 → 输入 exit
+请输入:
+🔒 [2025-03-14 05:07:09] 来自 刘备 的私聊消息:
+   可以的，三弟，叫上关羽
+
+
+```
+
+step6:好了，后端部分写完了，验证成功，可以展现当前在线用户列表，并且可以群聊，可以私发，接下来写前端angular
+
+step7:C:\Users\wangrusheng\WebstormProjects\untitled4\src\app\chat\chat.service.ts
+
+```javascript
+import { Injectable } from '@angular/core';
+import { webSocket, WebSocketSubject } from 'rxjs/webSocket';
+import { BehaviorSubject } from 'rxjs';
+
+export interface ChatMessage {
+  type: 'public' | 'private' | 'system';
+  from?: string;
+  to?: string;
+  sender_name?: string;
+  content: string;
+  timestamp: string;
+}
+
+export interface User {
+  client_id: string;
+  username: string;
+}
+
+@Injectable({ providedIn: 'root' })
+export class ChatService {
+  private socket$!: WebSocketSubject<any>;
+  private readonly WS_URL = 'ws://localhost:8000/ws';
+
+  public messages$ = new BehaviorSubject<ChatMessage[]>([]);
+  public users$ = new BehaviorSubject<User[]>([]);
+  public currentUser: User | null = null;
+
+  constructor() {
+    this.connect();
+  }
+
+  private connect() {
+    this.socket$ = webSocket({
+      url: this.WS_URL,
+      openObserver: {
+        next: () => this.initializeConnection()
+      },
+      serializer: msg => JSON.stringify(msg),
+      deserializer: e => JSON.parse(e.data)
+    });
+
+    this.socket$.subscribe({
+      next: msg => this.handleMessage(msg),
+      error: err => console.error('WS error:', err),
+      complete: () => console.log('WS connection closed')
+    });
+  }
+
+  private initializeConnection() {
+    const username = prompt('请输入用户名') || `用户${Date.now().toString().slice(-4)}`;
+    this.currentUser = {
+      client_id: '',
+      username: username
+    };
+    this.socket$.next({ username });
+  }
+
+  private handleMessage(msg: any) {
+    switch(msg.type) {
+      case 'user_list':
+        this.users$.next(msg.users);
+        if (!this.currentUser?.client_id && msg.users.length) {
+          this.currentUser!.client_id = msg.users.find((u: User) =>
+            u.username === this.currentUser?.username)?.client_id;
+        }
+        break;
+
+      case 'private':
+      case 'public':
+      case 'system':
+        this.messages$.next([...this.messages$.value, msg]);
+        break;
+    }
+  }
+
+  sendMessage(content: string, recipient?: string) {
+    if (recipient) {
+      this.socket$.next({
+        type: 'private',
+        to: recipient,
+        content
+      });
+    } else {
+      this.socket$.next({
+        content,
+        type: 'public'
+      });
+    }
+  }
+}
+
+```
+
+step8:C:\Users\wangrusheng\WebstormProjects\untitled4\src\app\chat\chat.component.ts
+
+```javascript
+import { Component, OnDestroy } from '@angular/core';
+import { ChatService, ChatMessage, User } from './chat.service';
+import {FormControl, ReactiveFormsModule} from '@angular/forms';
+import {AsyncPipe, DatePipe, NgForOf, NgIf} from '@angular/common';
+
+@Component({
+  selector: 'app-chat',
+  template: `
+    <div class="chat-container">
+      <!-- 用户列表 -->
+      <div class="user-list">
+        <div class="current-user">
+          <h3>{{ chatService.currentUser?.username }}</h3>
+          <small>ID: {{ chatService.currentUser?.client_id }}</small>
+        </div>
+
+        <div class="divider"></div>
+
+        <div *ngFor="let user of chatService.users$ | async"
+             class="user-item"
+             [class.active]="selectedUser?.client_id === user.client_id"
+             (click)="selectUser(user)">
+          <div class="username">{{ user.username }}</div>
+          <div class="client-id">ID: {{ user.client_id }}</div>
+        </div>
+      </div>
+
+      <!-- 聊天区域 -->
+      <div class="chat-area">
+        <div class="messages">
+          <div *ngFor="let msg of chatService.messages$ | async"
+               class="message"
+               [class.private]="msg.type === 'private'">
+
+            <div class="message-header">
+              <span class="sender">{{ msg.sender_name || '系统' }}</span>
+              <span class="time">{{ msg.timestamp | date:'HH:mm' }}</span>
+            </div>
+
+            <div class="content">{{ msg.content }}</div>
+
+            <div *ngIf="msg.type === 'private'" class="private-label">
+              {{ msg.from === chatService.currentUser?.client_id ? '发送给' : '来自' }}
+              {{ msg.from === chatService.currentUser?.client_id ? msg.to : msg.from }}
+            </div>
+          </div>
+        </div>
+
+        <div class="message-input">
+          <input [formControl]="messageControl"
+                 placeholder="输入消息..."
+                 (keyup.enter)="sendMessage()">
+          <button (click)="sendMessage()">发送</button>
+        </div>
+      </div>
+    </div>
+  `,
+  imports: [
+    NgForOf,
+    AsyncPipe,
+    DatePipe,
+    ReactiveFormsModule,
+    NgIf
+  ],
+  styleUrls: ['./chat.component.css']
+})
+export class ChatComponent {
+  messageControl = new FormControl('');
+  selectedUser: User | null = null;
+
+  constructor(public chatService: ChatService) {}
+
+  selectUser(user: User) {
+    this.selectedUser = this.selectedUser?.client_id === user.client_id ? null : user;
+  }
+
+  sendMessage() {
+    if (this.messageControl.value?.trim()) {
+      this.chatService.sendMessage(
+        this.messageControl.value,
+        this.selectedUser?.client_id
+      );
+      this.messageControl.reset();
+    }
+  }
+}
+
+```
+
+step9:C:\Users\wangrusheng\WebstormProjects\untitled4\src\app\chat\chat.component.css
+
+ 
+
+```css
+.chat-container {
+  display: flex;
+  height: 100vh;
+  font-family: Arial, sans-serif;
+}
+
+.user-list {
+  width: 280px;
+  background: #2c3e50;
+  color: white;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.current-user {
+  padding: 15px;
+  background: #34495e;
+  border-radius: 8px;
+  margin-bottom: 20px;
+}
+
+.current-user h3 {
+  margin: 0 0 5px;
+}
+
+.user-item {
+  padding: 12px;
+  margin: 8px 0;
+  background: #34495e;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.user-item:hover {
+  background: #3d566e;
+}
+
+.user-item.active {
+  background: #3498db;
+}
+
+.client-id {
+  font-size: 0.8em;
+  color: #95a5a6;
+}
+
+.chat-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  background: #ecf0f1;
+}
+
+.messages {
+  flex: 1;
+  padding: 20px;
+  overflow-y: auto;
+}
+
+.message {
+  background: white;
+  padding: 15px;
+  margin-bottom: 15px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.message.private {
+  border-left: 4px solid #3498db;
+}
+
+.message-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 0.9em;
+  color: #7f8c8d;
+}
+
+.private-label {
+  font-size: 0.8em;
+  color: #3498db;
+  margin-top: 8px;
+}
+
+.message-input {
+  padding: 20px;
+  background: white;
+  border-top: 1px solid #ddd;
+  display: flex;
+  gap: 10px;
+}
+
+.message-input input {
+  flex: 1;
+  padding: 12px;
+  border: 1px solid #ddd;
+  border-radius: 25px;
+  outline: none;
+}
+
+.message-input button {
+  padding: 12px 25px;
+  background: #3498db;
+  color: white;
+  border: none;
+  border-radius: 25px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.message-input button:hover {
+  background: #2980b9;
+}
+
+```
+
+end
